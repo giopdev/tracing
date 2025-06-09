@@ -30,8 +30,7 @@ def highlight_socket(line, sock):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(
-            f"Usage: {sys.argv[0]} <socket_# 1> <socket_# 2> ... <socket_# n>")
+        print(f"Usage: {sys.argv[0]} <socket_1> <socket_2> ... <socket_n>")
         sys.exit(1)
 
     sockets = sys.argv[1:]
