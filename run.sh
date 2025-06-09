@@ -1,3 +1,3 @@
 #!/bin/bash
 
-./triangleTrace.py ./src/main.cpp ./src/main.bin main.bin
+sudo ./triangleTrace.py ./src/main.bin ./src/main.cpp main.bin
