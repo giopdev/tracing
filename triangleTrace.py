@@ -191,6 +191,23 @@ class IOCTLTracer:
         events.perf_submit(args, &data, sizeof(data));
         return 0;
     }
+
+    int trace_ppoll(struct tracepoint__syscalls__sys_enter_ppoll *args) {
+        struct data_t data = {};
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        u32 tid = bpf_get_current_pid_tgid();
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data.pid = pid;
+        data.tid = tid;
+        data.fd = (u64)args->ufds;
+        data.cmd = args->nfds;
+        data.arg = (u64)args->tsp;
+        data.user_stack_id = stack_traces.get_stackid(args, BPF_F_USER_STACK);
+        data.kernel_stack_id = -1;
+        data.event_type = 4;
+        events.perf_submit(args, &data, sizeof(data));
+        return 0;
+    }
     """
 
     def __init__(self, binary_path, cpp_file_path, target_comm, ioctl_names):
@@ -281,6 +298,8 @@ class IOCTLTracer:
                                    fn_name="trace_recvmsg")
         self.bpf.attach_tracepoint(tp="syscalls:sys_enter_sendmsg",
                                    fn_name="trace_sendmsg")
+        self.bpf.attach_tracepoint(tp="syscalls:sys_enter_ppoll",
+                                   fn_name="trace_ppoll")
 
     def _setup_signal_handler(self):
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -293,6 +312,8 @@ class IOCTLTracer:
         color_codes = ''.join(self.COLORS[c] for c in colors)
         return f"{color_codes}{text}{self.COLORS['RESET']}"
 
+    # https://elixir.bootlin.com/linux/v6.15.1/source/include/uapi/asm-generic/ioctl.h
+    # https://docs.kernel.org/userspace-api/ioctl/ioctl-decoding.html
     @staticmethod
     def decode_ioctl(cmd):
         IOC_NRBITS = 8
@@ -441,11 +462,67 @@ class IOCTLTracer:
         fd_target = self.fd_map.get(fd, "unknown")
         return f"{fd} ({self.color(fd_target, 'YELLOW')})"
 
+    def _format_ppoll_fds(self, ufds_ptr, nfds, pid):
+        """Format the pollfd array for ppoll display"""
+        if nfds == 0 or nfds > 64:  # Sanity check
+            return f"[invalid nfds={nfds}]"
+
+        try:
+            import struct
+
+            mem_file = f"/proc/{pid}/mem"
+            try:
+                with open(mem_file, 'rb') as f:
+                    f.seek(ufds_ptr)
+                    data = f.read(8 * nfds)
+
+                    fds = []
+                    for i in range(nfds):
+                        offset = i * 8
+                        fd, events, revents = struct.unpack(
+                            'ihh', data[offset:offset+8])
+                        fd_target = self.fd_map.get(fd, "unknown")
+                        events_str = self._format_poll_events(events)
+                        fds.append(
+                            f"{{fd={fd}({self.color(fd_target, 'YELLOW')}), events={events_str}}}")
+
+                    return f"[{', '.join(fds)}]"
+            except:
+                pass
+
+        except Exception:
+            pass
+
+        # Fallback: just show the pointer and count
+        return f"[ufds=0x{ufds_ptr:x}, nfds={nfds}]"
+
+    def _format_poll_events(self, events):
+        """Format poll events bitmask"""
+        event_names = []
+        if events & 0x001:
+            event_names.append("POLLIN")
+        if events & 0x002:
+            event_names.append("POLLPRI")
+        if events & 0x004:
+            event_names.append("POLLOUT")
+        if events & 0x008:
+            event_names.append("POLLERR")
+        if events & 0x010:
+            event_names.append("POLLHUP")
+        if events & 0x020:
+            event_names.append("POLLNVAL")
+
+        if event_names:
+            return "|".join(event_names)
+        else:
+            return f"0x{events:x}"
+
     def print_full_event(self, user, kernel):
         syscall_name = {
             0: "ioctl",
             2: "recvmsg",
-            3: "sendmsg"
+            3: "sendmsg",
+            4: "ppoll"
         }.get(user.event_type, "unknown")
 
         name = self.IOCTL_NAMES.get(user.cmd,
@@ -454,21 +531,33 @@ class IOCTLTracer:
         print(
             self.color(f"=== {syscall_name.upper()} EVENT ===", 'BOLD',
                        'MAGENTA'))
-        print(
-            f"{self.color('comm:', 'BOLD', 'CYAN')} {user.comm.decode()} "
-            f"{self.color('pid:', 'BOLD', 'CYAN')} {user.pid} "
-            f"{self.color('tid:', 'BOLD', 'CYAN')} {user.tid} "
-            f"{self.color('fd:', 'BOLD', 'CYAN')} {
-                self.format_fd_info(user.fd)}"
-        )
 
-        if user.event_type == 0:
-            print(f"{self.color('cmd:', 'BOLD', 'CYAN')} 0x{user.cmd:x} "
-                  f"({self.color(name, 'YELLOW')})\n"
-                  f"{self.color('arg:', 'BOLD', 'CYAN')} 0x{user.arg:x} "
-                  f"[{self.decode_ioctl(user.cmd)}]")
+        if user.event_type == 4:  # ppoll - special handling
+            fds_info = self._format_ppoll_fds(user.fd, user.cmd, user.pid)
+            print(
+                f"{self.color('comm:', 'BOLD', 'CYAN')} {user.comm.decode()} "
+                f"{self.color('pid:', 'BOLD', 'CYAN')} {user.pid} "
+                f"{self.color('tid:', 'BOLD', 'CYAN')} {user.tid}"
+            )
+            print(f"{self.color('fds:', 'BOLD', 'CYAN')} {fds_info}")
+            print(f"{self.color('nfds:', 'BOLD', 'CYAN')} {user.cmd} "
+                  f"{self.color('timeout:', 'BOLD', 'CYAN')} 0x{user.arg:x}")
         else:
-            print(f"{self.color('arg:', 'BOLD', 'CYAN')} 0x{user.arg:x}")
+            print(
+                f"{self.color('comm:', 'BOLD', 'CYAN')} {user.comm.decode()} "
+                f"{self.color('pid:', 'BOLD', 'CYAN')} {user.pid} "
+                f"{self.color('tid:', 'BOLD', 'CYAN')} {user.tid} "
+                f"{self.color('fd:', 'BOLD', 'CYAN')} {
+                    self.format_fd_info(user.fd)}"
+            )
+
+            if user.event_type == 0:
+                print(f"{self.color('cmd:', 'BOLD', 'CYAN')} 0x{user.cmd:x} "
+                      f"({self.color(name, 'YELLOW')})\n"
+                      f"{self.color('arg:', 'BOLD', 'CYAN')} 0x{user.arg:x} "
+                      f"[{self.decode_ioctl(user.cmd)}]")
+            else:
+                print(f"{self.color('arg:', 'BOLD', 'CYAN')} 0x{user.arg:x}")
 
         if user.user_stack_id >= 0:
             print(self.color("User stack:", 'BOLD', 'GREEN'))
@@ -504,7 +593,7 @@ class IOCTLTracer:
     def run(self):
         print(
             self.color(
-                f"Tracing ioctl/sendmsg/recvmsg for {
+                f"Tracing ioctl/sendmsg/recvmsg/ppoll for {
                     self.target_comm}... Ctrl-C to end.",
                 'BOLD'))
         time.sleep(2.0)
